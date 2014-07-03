@@ -1,0 +1,670 @@
+/* vi:set wm=0 ai sm tabstop=4 shiftwidth=4: */
+
+#include <stdio.h>
+
+#include <EEPROM.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
+
+#include "adi_main.h"
+#include "airspeed.h"
+#include "pressure.h"
+
+/***********************************************************************
+* main program
+***********************************************************************/
+
+LiquidCrystal lcd(7,8,9,10,11,12);
+
+void setup()
+{
+	// for some reason, LOW is the only state that will take one int per
+	// button press
+	// interrupt if SET is pressed
+	attachInterrupt(0, set_handler, LOW);
+
+	analogReference(EXTERNAL);
+
+	pinMode(led_pin, OUTPUT);
+	pinMode(plus_btn_pin, INPUT);
+	pinMode(minus_btn_pin, INPUT);
+
+	//analogWrite(6, 175);  // PWM for LCD backlight
+
+	Wire.begin();
+	bmp085Calibration();
+
+	Serial.begin(9600);
+
+	lcd.begin(16,2);
+
+	init_vars(&system_vars); // pull data from EEPROM
+	init_menu(); // set up menu items and options
+
+	snprintf(disp_vars.vsi_unit, 4, "%s", "FPM");
+	disp_vars.last_vsi_time = 0;
+}
+
+void loop()
+{
+	static int led_state = HIGH;
+	static int prev_button = 0;
+	int plus;
+	int minus;
+
+	if (set_pressed)
+	{
+		if (millis() - last_interrupt > debounce_limit)
+		{
+			show_menu();
+		}
+		last_interrupt = millis();
+		set_pressed = false;
+	}
+
+	// timer to break us out of menu display
+	if (millis() - last_interrupt > system_vars.menu_timeout * 1000)
+	//if (millis() - last_interrupt > 10 * 1000)
+	{
+		in_menu = false;
+	}
+
+	if (in_menu)
+	{
+		plus = digitalRead(plus_btn_pin);
+		minus = digitalRead(minus_btn_pin);
+		if (prev_button == 0)
+		{
+			if (plus == LOW)
+			{
+				if (millis() - last_interrupt > debounce_limit)
+				{
+					prev_button = 1;
+					increment_menu_item();
+				}
+				last_interrupt = millis();
+			}
+			else if (minus == LOW)
+			{
+				if (millis() - last_interrupt > debounce_limit)
+				{
+					prev_button = 1;
+					decrement_menu_item();
+				}
+				last_interrupt = millis();
+			}
+		}
+		else
+		{
+			if (minus == HIGH && plus == HIGH)
+				prev_button = 0;
+		}
+	}
+	else
+	{
+		dpsensorValue = analogRead(0);
+		disp_vars.airspeed = get_speed(dpsensorValue);
+		//get_altitude(&disp_vars.altitude, &disp_vars.temp, 
+			//system_vars.kollsman_value);
+		get_altitude();
+		disp_vars.vsi = calc_vsi(&disp_vars);
+		update_display();
+		digitalWrite(led_pin, led_state);
+		led_state = !led_state;
+		delay(100);
+	}
+}
+
+/*----------------------------------------------------------------------
+* EEPROM locations (and defaults) are:
+* 0-3: kollsman value (Pa)
+* 4: speed units (mph)
+* 5: temperature units (F)
+* 6: altitude units (feet)
+* 7: kollsman units (inHg)
+* 8: menu timeout (5)j
+*
+* check into EEPROMWriteAnything if these EEPROM calls don't work
+----------------------------------------------------------------------*/
+void init_vars(struct vars * sysvars_ref)
+{
+	int i;
+	int check;
+	byte tmpval;
+	union // union type: all vars refer to same memory space
+	{
+		byte as_bytes[4];
+		float as_float;
+	} kollsman_v;
+
+	tmpval = EEPROM.read(SPEED_U_ADDR);
+	sysvars_ref -> speed_unit = (tmpval == 255) ? mph : (enum speed_u)tmpval;
+
+	tmpval = EEPROM.read(TEMP_U_ADDR);
+	sysvars_ref -> temp_unit = (tmpval == 255) ? F : (enum temp_u)tmpval;
+
+	tmpval = EEPROM.read(ALT_U_ADDR);
+	sysvars_ref -> alt_unit = (tmpval == 255) ? feet : (enum alt_u)tmpval;
+
+	tmpval = EEPROM.read(KOLL_U_ADDR);
+	sysvars_ref -> kollsman_unit = (tmpval == 255) ? inHg : 
+		(enum kollsman_u)tmpval;
+	last_kollsman_unit = sysvars_ref -> kollsman_unit;
+
+	tmpval = EEPROM.read(AS_M_ADDR);
+	sysvars_ref -> airspeed_mode = (tmpval == 255) ? ias : 
+		(enum airspeed_m)tmpval;
+
+	// remember to set the kollsman value *after* setting the units...
+	for (i=KOLL_ADDR; i<=(KOLL_ADDR+3); i++)
+	{
+		kollsman_v.as_bytes[i] = EEPROM.read(i);
+	}
+	sysvars_ref -> kollsman_value = (kollsman_v.as_float > 90000.0 && 
+		kollsman_v.as_float < 106000.0) ?  kollsman_v.as_float : 101320.74891;
+	//sysvars_ref -> kollsman_value = 101320.74891;
+	sysvars_ref -> disp_kollsman_value = 
+		conv_2_disp_pres(sysvars_ref -> kollsman_value);
+
+	tmpval = EEPROM.read(TIMEOUT_ADDR);
+	sysvars_ref -> menu_timeout = (tmpval == 255) ? 5 : tmpval;
+
+	tmpval = EEPROM.read(BACKLIGHT_ADDR); 
+	sysvars_ref -> backlight = (tmpval == 255) ? 5 : tmpval;
+}
+
+
+void init_menu()
+{
+	size_t strlen = 17;
+
+	snprintf(menu_items[0].name, strlen, "%-16s", "Kollsman:");
+	change_koll(system_vars.disp_kollsman_value);
+	menu_items[0].display_type = float_value;
+	menu_items[0].addr = KOLL_ADDR;
+
+	snprintf(menu_items[1].name, strlen, "%-16s", "Speed in:");
+	snprintf(menu_items[1].labels[0], strlen, "%-16s", "MPH");
+	snprintf(menu_items[1].labels[1], strlen, "%-16s", "KPH");
+	snprintf(menu_items[1].labels[2], strlen, "%-16s", "Knots");
+	snprintf(menu_items[1].disp_labels[0], 4, "%s", "MPH");
+	snprintf(menu_items[1].disp_labels[1], 4, "%s", "KPH");
+	snprintf(menu_items[1].disp_labels[2], 4, "%s", "KNT");
+	menu_items[1].enum_value = system_vars.speed_unit;
+	menu_items[1].display_type = enum_value;
+	menu_items[1].addr = SPEED_U_ADDR;
+
+	snprintf(menu_items[2].name, strlen, "%-16s", "Temperature in:");
+	snprintf(menu_items[2].labels[0], strlen, "%-16s", "C");
+	snprintf(menu_items[2].labels[1], strlen, "%-16s", "F");
+	snprintf(menu_items[2].disp_labels[0], 2, "%s", "C");
+	snprintf(menu_items[2].disp_labels[1], 2, "%s", "F");
+	menu_items[2].enum_value = system_vars.temp_unit;
+	menu_items[2].display_type = enum_value;
+	menu_items[2].addr = TEMP_U_ADDR;
+
+	snprintf(menu_items[3].name, strlen, "%-16s", "Altitude in:");
+	snprintf(menu_items[3].labels[0], strlen, "%-16s", "Feet");
+	snprintf(menu_items[3].labels[1], strlen, "%-16s", "Meters");
+	snprintf(menu_items[3].disp_labels[0], 2, "%s", "'");
+	snprintf(menu_items[3].disp_labels[1], 2, "%s", "m");
+	menu_items[3].enum_value = system_vars.alt_unit;
+	menu_items[3].display_type = enum_value;
+	menu_items[3].addr = ALT_U_ADDR;
+
+	snprintf(menu_items[4].name, strlen, "%-16s", "Kollsman in:");
+	snprintf(menu_items[4].labels[0], strlen, "%-16s", "Inches of Hg");
+	snprintf(menu_items[4].labels[1], strlen, "%-16s", "Millibars");
+	menu_items[4].enum_value = system_vars.kollsman_unit;
+	menu_items[4].display_type = enum_value;
+	menu_items[4].addr = KOLL_U_ADDR;
+
+	snprintf(menu_items[5].name, strlen, "%-16s", "Menu timeout:");
+	menu_items[5].int_value = system_vars.menu_timeout;
+	menu_items[5].int_max = 60;
+	menu_items[5].int_min = 2;
+	menu_items[5].display_type = int_value;
+	menu_items[5].addr = TIMEOUT_ADDR;
+
+	snprintf(menu_items[6].name, strlen, "%-16s", "Airspeed mode:");
+	snprintf(menu_items[6].labels[0], strlen, "%-16s", "IAS");
+	snprintf(menu_items[6].labels[1], strlen, "%-16s", "TAS");
+	snprintf(menu_items[6].disp_labels[0], 2, "%s", "I");
+	snprintf(menu_items[6].disp_labels[1], 2, "%s", "T");
+	menu_items[6].enum_value = system_vars.airspeed_mode;
+	menu_items[6].display_type = enum_value;
+	menu_items[6].addr = AS_M_ADDR;
+
+	snprintf(menu_items[7].name, strlen, "%-16s", "Backlight:");
+	menu_items[7].int_value = system_vars.backlight;
+	menu_items[7].int_max = 5;
+	menu_items[7].int_min = 0;
+	menu_items[7].display_type = int_value;
+	menu_items[7].addr = BACKLIGHT_ADDR;
+
+	// reset num_menu_items in the .h file if you add or subtract menu items
+
+	update_sys_vars();
+}
+
+/* call when changing kollsman value or units */
+/* pass display kollsman unit */
+void change_koll(float koll)
+{
+	float l_koll;
+	const enum kollsman_u curr_koll_unit = system_vars.kollsman_unit;
+
+	if (last_kollsman_unit != system_vars.kollsman_unit)
+	{
+		system_vars.kollsman_unit = last_kollsman_unit;
+		l_koll = conv_2_int_pres(koll);
+		system_vars.kollsman_unit = curr_koll_unit;
+		system_vars.kollsman_value = l_koll;
+		system_vars.disp_kollsman_value = conv_2_disp_pres(l_koll);
+		menu_items[0].float_value = system_vars.disp_kollsman_value;
+	}
+	else
+	{
+		menu_items[0].float_value = koll;
+		system_vars.kollsman_value = conv_2_int_pres(koll);
+		system_vars.disp_kollsman_value = koll;
+	}
+
+	switch (system_vars.kollsman_unit)
+	{
+		case inHg:
+			menu_items[0].float_max = 31.3;
+			menu_items[0].float_min = 26.58;
+			break;
+
+		case mb:
+			menu_items[0].float_max = 1060.0;
+			menu_items[0].float_min = 900.0;
+			break;
+	}
+
+	last_kollsman_unit = curr_koll_unit;
+}
+
+
+// set_handler just sets a flag, then show_menu happens as part of the 
+// main loop
+void set_handler()
+{
+	set_pressed = true;
+}
+
+// show_menu is called as a result of an interrupt from the SET button, so it
+// has to keep its own state, and be able to both show the menu, and 
+// advance it to the next menu item
+void show_menu()
+{
+	char output[33]; // probably actually wants to be 17
+	float f_val;
+
+	if (in_menu)
+	{
+		// advance the menu selection
+		menu_index++;
+		menu_index %= num_menu_items;
+	}
+	else
+	{
+		// start with position zero
+		menu_index = 0;
+	}
+	in_menu = true;
+
+	output_line(0, menu_items[menu_index].name);
+
+	switch (menu_items[menu_index].display_type)
+	{
+		case int_value:
+			snprintf(output, 17, "%-16d", menu_items[menu_index].int_value);
+			output_line(1, output);
+			break;
+
+		case float_value:
+			f_val = menu_items[menu_index].float_value;
+			//get_altitude();
+			switch(system_vars.kollsman_unit)
+			{
+				case inHg:
+					snprintf(output, 17, "%d.%02d [%5d%s]  ", (int)f_val, 
+						(int)(f_val*100)%100, disp_vars.altitude, disp_vars.
+						alt_unit);
+					break;
+
+				case mb:
+					snprintf(output, 17, "%d [%5d%s]   ", (int)f_val, disp_vars.
+						altitude, disp_vars.alt_unit);
+					break;
+			}
+			output_line(1, output);
+			break;
+
+		case enum_value:
+			output_line(1, menu_items[menu_index].
+				labels[(int)menu_items[menu_index].enum_value]);
+			break;
+
+		default:
+			output_line(1, "No data");
+			break;
+	}
+}
+
+void update_display()
+{
+	char line_one[17];
+	char line_two[17];
+
+	snprintf(line_one, 17, "%3d %3s %s  %3d%c%s", disp_vars.airspeed, 
+		disp_vars.speed_unit, disp_vars.airspeed_mode, disp_vars.temp, 
+		(char)223, disp_vars.temp_unit);
+
+	snprintf(line_two, 17, "%5d%s %5d %3s", disp_vars.altitude, 
+		disp_vars.alt_unit, disp_vars.vsi, disp_vars.vsi_unit);
+
+	output_line(0, line_one);
+	output_line(1, line_two);
+}
+
+/*----------------------------------------------------------------------
+* simple function to output a line of data.  to be updated later to
+* output to the LCD.
+----------------------------------------------------------------------*/
+void output_line(int lineno, char * string)
+{
+	// let's keep from spamming the serial line, shall we?
+	if (millis() - last_print < 100)
+	{
+		last_print = millis();
+		return;
+	}
+	//printf("%d: %s\n", lineno, string);
+	//Serial.println(string);
+
+	lcd.setCursor(0, lineno);
+	lcd.print(string);
+}
+
+/*----------------------------------------------------------------------
+* convert from Pa to display-unit pressure.  Pa is used internally (the
+* pressure sensor returns Pa).
+----------------------------------------------------------------------*/
+float conv_2_disp_pres(float pressure)
+{
+	float disp;
+
+	switch (system_vars.kollsman_unit)
+	{
+		case inHg:
+			disp = (pressure * 0.000295301);
+			break;
+
+		case mb:
+			disp = (pressure * 0.01);
+			break;
+
+		default:
+			disp = (-1);
+			break;
+	}
+
+	// returned pressure looks good
+	return(disp);
+}
+
+/*----------------------------------------------------------------------
+* convert from display-unit pressure to internal pressure.  Pa is used
+* internally.
+----------------------------------------------------------------------*/
+float conv_2_int_pres(float pressure)
+{
+	switch (system_vars.kollsman_unit)
+	{
+		case inHg:
+			return(pressure * 3386.3753);
+			break;
+
+		case mb:
+			return(pressure * 100);
+			break;
+
+		default:
+			return(-1);
+			break;
+	}
+}
+
+// left off here
+/* now have to actually change system values here, as well as simply storing
+* the new value in memory, so that display parameters are affected */
+void increment_menu_item()
+{
+	char output[17];
+	float new_koll;
+
+	switch (menu_items[menu_index].display_type)
+	{
+		case int_value:
+			if (++menu_items[menu_index].int_value > 
+					menu_items[menu_index].int_max)
+				menu_items[menu_index].int_value = 
+					menu_items[menu_index].int_min;
+			snprintf(output, 17, "%-16d", menu_items[menu_index].int_value);
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		case float_value: // must be kollsman...
+			new_koll = menu_items[menu_index].float_value;
+			if (system_vars.kollsman_unit == mb)
+			{
+				new_koll += 1.0;
+				if (new_koll > menu_items[menu_index].float_max)
+					new_koll = menu_items[menu_index].float_min;
+				change_koll(new_koll);
+				get_altitude();
+				snprintf(output, 17, "%d [%5d%s]", (int)new_koll, disp_vars.
+					altitude, disp_vars.alt_unit);
+			}
+			else // must be inHg
+			{
+				new_koll += .01;
+				if (new_koll > menu_items[menu_index].float_max)
+					new_koll = menu_items[menu_index].float_min;
+				change_koll(new_koll);
+				get_altitude();
+				snprintf(output, 17, "%d.%02d [%5d%s]", (int)new_koll, 
+					(int)(new_koll*100)%100, disp_vars.altitude, 
+					disp_vars.alt_unit);
+			}
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		case enum_value:
+			increment_enum(&menu_items[menu_index]);
+			snprintf(output, 17, "%-16s", menu_items[menu_index].
+				labels[(int)menu_items[menu_index].enum_value]);
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		default:
+			snprintf(output, 17, "Type not found");
+			break;
+	}
+
+	update_sys_vars();
+	change_koll(system_vars.disp_kollsman_value);
+	output_line(1, output);
+}
+
+void decrement_menu_item()
+{
+	char output[17];
+	float new_koll;
+
+	switch (menu_items[menu_index].display_type)
+	{
+		case int_value:
+			if (--menu_items[menu_index].int_value < 
+					menu_items[menu_index].int_min)
+				menu_items[menu_index].int_value = 
+					menu_items[menu_index].int_max;
+			snprintf(output, 17, "%-16d", menu_items[menu_index].int_value);
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		case float_value: // must be kollsman...
+			new_koll = menu_items[menu_index].float_value;
+			if (system_vars.kollsman_unit == mb)
+			{
+				new_koll -= 1.0;
+				if (new_koll < menu_items[menu_index].float_min)
+					new_koll = menu_items[menu_index].float_max;
+				change_koll(new_koll);
+				get_altitude();
+				snprintf(output, 17, "%d [%5d%s]", (int)new_koll, disp_vars.
+					altitude, disp_vars.alt_unit);
+			}
+			else // must be inHg
+			{
+				new_koll -= .01;
+				if (new_koll < menu_items[menu_index].float_min)
+					new_koll = menu_items[menu_index].float_max;
+				change_koll(new_koll);
+				get_altitude();
+				snprintf(output, 17, "%d.%02d [%5d%s]", (int)new_koll, 
+					(int)(new_koll*100)%100, disp_vars.altitude, 
+					disp_vars.alt_unit);
+			}
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		case enum_value:
+			decrement_enum(&menu_items[menu_index]);
+			snprintf(output, 17, "%-16s", menu_items[menu_index].
+				labels[(int)menu_items[menu_index].enum_value]);
+			write_mem(&menu_items[menu_index]);
+			break;
+
+		default:
+			snprintf(output, 17, "Type not found");
+			break;
+	}
+
+	update_sys_vars();
+	change_koll(system_vars.disp_kollsman_value);
+	output_line(1, output);
+}
+
+void write_mem(struct menu_item * item)
+{
+	int i;
+	int j;
+	union // union type: all vars refer to same memory space
+	{
+		byte as_bytes[4];
+		float as_float;
+	} float_v;
+
+	switch (item -> display_type)
+	{
+		case int_value:
+			EEPROM.write(item -> addr, item -> int_value);
+			break;
+
+		case float_value:
+			float_v.as_float = conv_2_int_pres(item -> float_value);
+			for(i=0; i<=3; i++)
+			{
+				j = i + item -> addr;
+				EEPROM.write(j, float_v.as_bytes[i]);
+			}
+			
+			//EEPROM_writeFloat(item -> addr, &item -> float_value);
+			break;
+
+		case enum_value:
+			EEPROM.write(item -> addr, (byte)item -> enum_value);
+			break;
+
+		default:
+			break;
+	}
+}
+
+void increment_enum(struct menu_item * item)
+{
+	if (strcmp(item -> name, "Speed in:       ") == 0)
+	{
+		switch ((enum speed_u)item -> enum_value)
+		{
+			case mph:
+				item -> enum_value = 1;
+				break;
+
+			case kph:
+				item -> enum_value = 2;
+				break;
+
+			case knots:
+				item -> enum_value = 0;
+				break;
+		}
+	}
+	else
+	{
+		item -> enum_value = (item -> enum_value == 0) ? 1 : 0;
+	}
+}
+
+void decrement_enum(struct menu_item * item)
+{
+	if (strcmp(item -> name, "Speed in:       ") == 0)
+	{
+		switch ((enum speed_u)item -> enum_value)
+		{
+			case mph:
+				item -> enum_value = 2;
+				break;
+
+			case kph:
+				item -> enum_value = 0;
+				break;
+
+			case knots:
+				item -> enum_value = 1;
+				break;
+		}
+	}
+	else
+	{
+		item -> enum_value = (item -> enum_value == 0) ? 1 : 0;
+	}
+}
+
+void update_sys_vars()
+{
+	system_vars.disp_kollsman_value = menu_items[0].float_value;
+	system_vars.speed_unit = (enum speed_u)menu_items[1].enum_value;
+	snprintf(disp_vars.speed_unit, 4, "%s", menu_items[1].
+		disp_labels[(int)menu_items[1].enum_value]);
+	system_vars.temp_unit = (enum temp_u)menu_items[2].enum_value;
+	snprintf(disp_vars.temp_unit, 2, "%s", menu_items[2].
+		disp_labels[(int)menu_items[2].enum_value]);
+	system_vars.alt_unit = (enum alt_u)menu_items[3].enum_value;
+	snprintf(disp_vars.alt_unit, 2, "%s", menu_items[3].
+		disp_labels[(int)menu_items[3].enum_value]);
+	system_vars.kollsman_unit = (enum kollsman_u)menu_items[4].enum_value;
+	system_vars.menu_timeout = menu_items[5].int_value;
+	system_vars.airspeed_mode = (enum airspeed_m)menu_items[6].enum_value;
+	snprintf(disp_vars.airspeed_mode, 2, "%s",  menu_items[6].
+		disp_labels[(int)menu_items[6].enum_value]);
+	system_vars.kollsman_value = 
+		conv_2_int_pres(system_vars.disp_kollsman_value);
+	system_vars.backlight = menu_items[7].int_value;
+	Serial.println("updating backlight value");
+	analogWrite(backlight_pin, (menu_items[7].int_value * (255/5)));
+}

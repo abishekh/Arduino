@@ -1,0 +1,130 @@
+/* vi:set wm=0 ai sm tabstop=4 shiftwidth=4: */
+
+/***********************************************************************
+* first attempts at working out a menu system
+*
+* use a button as an interrupt to get to the menu system
+***********************************************************************/
+
+
+/***********************************************************************
+* #defines
+***********************************************************************/
+
+#define KOLL_ADDR 0
+#define TIMEOUT_ADDR 4
+#define ALT_U_ADDR 5
+#define SPEED_U_ADDR 6
+#define TEMP_U_ADDR 7
+#define KOLL_U_ADDR 8
+#define AS_M_ADDR 9
+#define BACKLIGHT_ADDR 10
+
+/***********************************************************************
+* data structure declarations
+***********************************************************************/
+
+// define some unit enums
+enum alt_u {feet, meters};
+enum speed_u {mph, kph, knots};
+enum temp_u {C, F};
+enum kollsman_u {inHg, mb};
+enum airspeed_m {ias, tas};
+enum display_t {enum_value, int_value, float_value};
+
+enum kollsman_u last_kollsman_unit;
+
+bool set_pressed = false;
+
+struct menu_item
+{
+	char name[17];
+	char labels[3][17];
+	char disp_labels[3][4];
+	int enum_value;
+	int int_value;
+	int int_max;
+	int int_min;
+	float float_value;
+	float float_max;
+	float float_min;
+	enum display_t display_type;
+	int addr;
+};
+
+const int num_menu_items = 8;  // set in init_menu
+struct menu_item menu_items[num_menu_items];
+
+// the main system variables and their defaults. 
+// internal units are:
+// pressure: Pa
+// speed: kph
+// altitude: meters
+// temperature: C
+struct vars
+{
+	int menu_timeout;
+	enum alt_u alt_unit;
+	enum speed_u speed_unit;
+	enum temp_u temp_unit;
+	enum kollsman_u kollsman_unit;
+	enum airspeed_m airspeed_mode;
+	float kollsman_value;
+	float disp_kollsman_value; // what actually gets shown to the human
+	int backlight;
+};
+
+//declare the actual system variables data structure
+struct vars system_vars;
+
+struct disp
+{
+	int altitude;
+	int airspeed;
+	int temp;
+	int vsi;
+	char speed_unit[4];
+	char alt_unit[2];
+	char airspeed_mode[2];
+	char temp_unit[2];
+	char vsi_unit[4];
+	unsigned long last_vsi_time;
+	int last_alt;
+	float static_pressure;  // kPa
+};
+
+// the actual information to be displayed on the next display update
+struct disp disp_vars;
+
+/***********************************************************************
+* global variables
+***********************************************************************/
+const int led_pin = 13;
+const int plus_btn_pin = 4;
+const int minus_btn_pin = 5;
+const int backlight_pin = 6;
+
+bool in_menu = false;
+int menu_index = 0;
+
+const long debounce_limit = 100; // milliseconds
+long last_interrupt;
+long last_print = 0;
+
+int dpsensorValue;  // differential pressure sensor value, for airspeed
+
+/***********************************************************************
+* prototype declarations
+***********************************************************************/
+struct vars init_vars();
+void init_menu();
+void show_menu();
+void update_display();
+void output_line(int lineno, char * string);
+float conv_2_disp_pres(float pressure);
+float conv_2_int_pres(float pressure);
+void increment_menu_item();
+void decrement_menu_item();
+void write_mem(struct menu_item menu);
+void increment_enum(struct menu_item * item);
+void decrement_enum(struct menu_item * item);

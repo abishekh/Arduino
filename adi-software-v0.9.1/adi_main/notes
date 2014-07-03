@@ -1,0 +1,69 @@
+notes on the Dangerpants Labs Air Data Instrument
+
+these notes briefly describe some of the information you need to put
+together an ADI.  where information is missing (ie, full hookup of the
+LCD), that information is widel available online.
+
+digital pins:
+
+arduino: function
+2: SET button
+4: + button
+5: - button
+6: backlight pwm (future)
+7: LCD RS
+8: LCD EN
+9: LCD DB4
+10: LCD DB5
+11: LCD DB6
+12: LCD DB7
+
+analog pins:
+
+A0: differential pressure in
+A4: I2C SDA (BMP085 and DS1307 clock)
+A5: I2C SCL (BMP085 and DS1307 clock)
+
+LCD pins:
+
+1: ground
+2: +5v
+3: contrast pot wiper
+4: RS arduino pin 7
+5: ground
+6: EN arduino pin 8
+
+11: DB4 arduino pin 9
+12: DB5 arduino pin 10
+13: DB6 arduino pin 11
+14: DB7 arduino pin 12
+15: arduino pin 6 (backlight)
+16: ground
+
+AREF set to 2.5v with 2x 500 ohm resistor voltage splitter
+
+NOTE: Barometric pressure sensor must have 3.6V max supply voltage, do
+not feed with 5V!
+
+SET, + and - buttons are pulled high by the arduino's internal 10k
+resistors, then ground when closed
+
+LCD contrast is set with 10k trimmer pot as voltage divider, wiper to
+LCD pin 3
+
+parts list:
+
+* Arduino Uno (or similar, with ATMEGA328 processor)
+* Sparkfun BMP085 barometric pressure sensor breakout
+* DIYDrones MPXV5004DP differential pressure sensor breakout
+* DS1307 clock module (various sources)
+* 16x2 character LCD
+* 3x momentary, NO pushbuttons
+* 10k potentiometer
+* 2x 500 ohm resistors
+
+when installed, the ADI will be powered via a vehicle 12V system,
+probably through a 7805 voltage regulator.  it could also be operated
+from 3xAA batteries.  at one point (before the clock module was added)
+current draw was around 150 mA at full backlight, so a set of NiMH AAs
+should last about 10 hours in the real world.
